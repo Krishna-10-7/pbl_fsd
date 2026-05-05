@@ -7,3 +7,6 @@ frontend/.env
 dist/
 coverage/
 .vscode/
+__pycache__/
+*.pyc
+*.db

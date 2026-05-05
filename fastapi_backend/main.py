@@ -1,19 +1,22 @@
 import hashlib
+import asyncio
+import json
 import os
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Set, Any
 
 import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "collabspace.db"
 JWT_SECRET = os.getenv("JWT_SECRET", "collabspace-fastapi-dev-secret")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 ALGORITHM = "HS256"
 TOKEN_EXPIRY_DAYS = 7
 
@@ -25,6 +28,68 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+class WorkspaceConnectionManager:
+    def __init__(self) -> None:
+        self.workspaces: Dict[str, Set[WebSocket]] = {}
+        self.socket_workspace: Dict[int, str] = {}
+
+    async def connect(self, workspace_id: str, websocket: WebSocket) -> None:
+        await websocket.accept()
+        self.workspaces.setdefault(workspace_id, set()).add(websocket)
+        self.socket_workspace[id(websocket)] = workspace_id
+
+    def disconnect(self, websocket: WebSocket) -> None:
+        workspace_id = self.socket_workspace.pop(id(websocket), None)
+        if not workspace_id:
+            return
+        sockets = self.workspaces.get(workspace_id)
+        if not sockets:
+            return
+        sockets.discard(websocket)
+        if not sockets:
+            self.workspaces.pop(workspace_id, None)
+
+    async def broadcast(self, workspace_id: str, message: dict, exclude: WebSocket | None = None) -> None:
+        sockets = list(self.workspaces.get(workspace_id, set()))
+        for websocket in sockets:
+            if exclude is not None and websocket is exclude:
+                continue
+            try:
+                await websocket.send_json(message)
+            except Exception:
+                self.disconnect(websocket)
+
+
+workspace_connections = WorkspaceConnectionManager()
+
+
+def broadcast_workspace_event(workspace_id: str, event_type: str, payload: dict, exclude: WebSocket | None = None) -> None:
+    asyncio.run(workspace_connections.broadcast(workspace_id, {"type": event_type, "workspaceId": workspace_id, "payload": payload}, exclude=exclude))
+
+
+def get_workspace_membership(conn: sqlite3.Connection, workspace_id: str, user_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?",
+        (workspace_id, user_id),
+    ).fetchone()
+
+
+def get_workspace_snapshot(conn: sqlite3.Connection, workspace_id: str) -> dict:
+    documents = [dict(row) for row in conn.execute("SELECT id, workspace_id, title, content, updated_at FROM documents WHERE workspace_id = ? ORDER BY updated_at DESC", (workspace_id,)).fetchall()]
+    tasks = [dict(row) for row in conn.execute("SELECT id, workspace_id, title, status, assignee_id, created_at FROM tasks WHERE workspace_id = ? ORDER BY created_at DESC", (workspace_id,)).fetchall()]
+    chat = [dict(row) for row in conn.execute("SELECT id, workspace_id, user_id, message, created_at FROM chat_messages WHERE workspace_id = ? ORDER BY created_at ASC", (workspace_id,)).fetchall()]
+    board_row = conn.execute("SELECT elements, app_state, files, updated_by, updated_at FROM board_state WHERE workspace_id = ?", (workspace_id,)).fetchone()
+    board = {"elements": [], "appState": {}, "files": {}, "updatedBy": None, "updatedAt": None}
+    if board_row:
+        board = {
+            "elements": json.loads(board_row["elements"]),
+            "appState": json.loads(board_row["app_state"]),
+            "files": json.loads(board_row["files"]),
+            "updatedBy": board_row["updated_by"],
+            "updatedAt": board_row["updated_at"],
+        }
+    return {"documents": documents, "tasks": tasks, "chat": chat, "board": board}
 
 
 def utc_now() -> str:
@@ -102,6 +167,10 @@ class ChatInput(BaseModel):
     message: str = Field(min_length=1, max_length=5000)
 
 
+class InviteMemberInput(BaseModel):
+    email: Optional[str] = None
+
+
 def init_db() -> None:
     conn = get_connection()
     conn.executescript(
@@ -166,20 +235,147 @@ def init_db() -> None:
           message TEXT NOT NULL,
           created_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS workspace_invites (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          token TEXT NOT NULL UNIQUE,
+          invitee_email TEXT,
+          role TEXT NOT NULL DEFAULT 'member',
+          created_by TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          accepted_by TEXT,
+          accepted_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS board_state (
+          workspace_id TEXT PRIMARY KEY,
+          elements TEXT NOT NULL,
+          app_state TEXT NOT NULL,
+          files TEXT NOT NULL,
+          updated_by TEXT,
+          updated_at TEXT NOT NULL
+        );
         """
     )
     conn.commit()
     conn.close()
 
 
+def normalize_workspace_roles() -> None:
+    conn = get_connection()
+    workspaces = conn.execute("SELECT id, owner_id FROM workspaces").fetchall()
+
+    for workspace in workspaces:
+        owner_row = conn.execute(
+            "SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?",
+            (workspace["id"], workspace["owner_id"]),
+        ).fetchone()
+
+        if owner_row:
+            conn.execute(
+                "UPDATE workspace_members SET role = 'admin' WHERE workspace_id = ? AND user_id = ?",
+                (workspace["id"], workspace["owner_id"]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO workspace_members(workspace_id, user_id, role, created_at) VALUES (?, ?, 'admin', ?)",
+                (workspace["id"], workspace["owner_id"], utc_now()),
+            )
+
+        conn.execute(
+            "UPDATE workspace_members SET role = 'member' WHERE workspace_id = ? AND user_id <> ?",
+            (workspace["id"], workspace["owner_id"]),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def build_invite_url(token: str) -> str:
+    return f"{FRONTEND_URL.rstrip('/')}/?invite={token}"
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
+    normalize_workspace_roles()
 
 
 @app.get("/health")
 def health() -> dict:
     return {"ok": True, "service": "collabspace-fastapi-backend"}
+
+
+@app.websocket("/ws/{workspace_id}")
+async def workspace_socket(websocket: WebSocket, workspace_id: str) -> None:
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=1008)
+        return
+
+    try:
+        user = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+    except jwt.PyJWTError:
+        await websocket.close(code=1008)
+        return
+
+    conn = get_connection()
+    membership = get_workspace_membership(conn, workspace_id, user["id"])
+    if not membership:
+        conn.close()
+        await websocket.close(code=1008)
+        return
+
+    await workspace_connections.connect(workspace_id, websocket)
+    snapshot = get_workspace_snapshot(conn, workspace_id)
+    workspace = conn.execute("SELECT id, name, description, created_at FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
+    conn.close()
+
+    await websocket.send_json({
+        "type": "workspace_snapshot",
+        "workspaceId": workspace_id,
+        "payload": {"workspace": dict(workspace) if workspace else None, **snapshot},
+    })
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            message_type = data.get("type")
+
+            if message_type == "ping":
+                await websocket.send_json({"type": "pong", "workspaceId": workspace_id, "payload": {"ts": utc_now()}})
+                continue
+
+            if message_type == "board_change":
+                conn = get_connection()
+                conn.execute(
+                    """INSERT OR REPLACE INTO board_state(workspace_id, elements, app_state, files, updated_by, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        workspace_id,
+                        json.dumps(data.get("elements", [])),
+                        json.dumps(data.get("appState", {})),
+                        json.dumps(data.get("files", {})),
+                        user["id"],
+                        utc_now(),
+                    ),
+                )
+                conn.commit()
+                conn.close()
+                await workspace_connections.broadcast(
+                    workspace_id,
+                    {"type": "board_updated", "workspaceId": workspace_id, "payload": {"elements": data.get("elements", []), "appState": data.get("appState", {}), "files": data.get("files", {}), "updatedBy": user["id"]}},
+                    exclude=websocket,
+                )
+            elif message_type == "workspace_refresh":
+                conn = get_connection()
+                snapshot = get_workspace_snapshot(conn, workspace_id)
+                conn.close()
+                await websocket.send_json({"type": "workspace_snapshot", "workspaceId": workspace_id, "payload": snapshot})
+    except WebSocketDisconnect:
+        workspace_connections.disconnect(websocket)
 
 
 @app.post("/api/auth/register")
@@ -297,6 +493,7 @@ def create_document(input_data: DocumentInput, user: dict = Depends(decode_token
         "SELECT id, workspace_id, title, content, updated_at FROM documents WHERE id = ?",
         (doc_id,),
     ).fetchone()
+    broadcast_workspace_event(input_data.workspaceId, "workspace_mutation", {"entity": "document", "action": "created", "document": dict(row)})
     conn.close()
     return dict(row)
 
@@ -330,6 +527,7 @@ def update_document(document_id: str, input_data: DocumentPatchInput, user: dict
         "SELECT id, workspace_id, title, content, updated_at FROM documents WHERE id = ?",
         (document_id,),
     ).fetchone()
+    broadcast_workspace_event(row["workspace_id"], "workspace_mutation", {"entity": "document", "action": "updated", "document": dict(row)})
     conn.close()
     return dict(row)
 
@@ -369,6 +567,7 @@ def create_task(input_data: TaskInput, user: dict = Depends(decode_token)) -> di
         "SELECT id, workspace_id, title, status, assignee_id, created_at FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
+    broadcast_workspace_event(input_data.workspaceId, "workspace_mutation", {"entity": "task", "action": "created", "task": dict(row)})
     conn.close()
     return dict(row)
 
@@ -397,6 +596,7 @@ def update_task(task_id: str, input_data: TaskPatchInput, _user: dict = Depends(
         "SELECT id, workspace_id, title, status, assignee_id, created_at FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
+    broadcast_workspace_event(row["workspace_id"], "workspace_mutation", {"entity": "task", "action": "updated", "task": dict(row)})
     conn.close()
     return dict(row)
 
@@ -436,6 +636,7 @@ def create_chat(input_data: ChatInput, user: dict = Depends(decode_token)) -> di
         "SELECT id, workspace_id, user_id, message, created_at FROM chat_messages WHERE id = ?",
         (msg_id,),
     ).fetchone()
+    broadcast_workspace_event(input_data.workspaceId, "workspace_mutation", {"entity": "chat", "action": "created", "message": dict(row)})
     conn.close()
     return dict(row)
 
@@ -491,6 +692,7 @@ def delete_workspace(workspace_id: str, user: dict = Depends(decode_token)) -> d
     conn.execute("DELETE FROM workspace_members WHERE workspace_id = ?", (workspace_id,))
     conn.execute("DELETE FROM workspaces WHERE id = ?", (workspace_id,))
     conn.commit()
+    broadcast_workspace_event(workspace_id, "workspace_deleted", {"workspaceId": workspace_id})
     conn.close()
     return {"ok": True}
 
@@ -498,13 +700,14 @@ def delete_workspace(workspace_id: str, user: dict = Depends(decode_token)) -> d
 @app.delete("/api/documents/item/{document_id}")
 def delete_document(document_id: str, _user: dict = Depends(decode_token)) -> dict:
     conn = get_connection()
-    existing = conn.execute("SELECT id FROM documents WHERE id = ?", (document_id,)).fetchone()
+    existing = conn.execute("SELECT id, workspace_id FROM documents WHERE id = ?", (document_id,)).fetchone()
     if not existing:
         conn.close()
         raise HTTPException(status_code=404, detail="Document not found")
     conn.execute("DELETE FROM document_versions WHERE document_id = ?", (document_id,))
     conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
     conn.commit()
+    broadcast_workspace_event(existing["workspace_id"], "workspace_mutation", {"entity": "document", "action": "deleted", "documentId": document_id})
     conn.close()
     return {"ok": True}
 
@@ -512,12 +715,13 @@ def delete_document(document_id: str, _user: dict = Depends(decode_token)) -> di
 @app.delete("/api/tasks/{task_id}")
 def delete_task(task_id: str, _user: dict = Depends(decode_token)) -> dict:
     conn = get_connection()
-    existing = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    existing = conn.execute("SELECT id, workspace_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if not existing:
         conn.close()
         raise HTTPException(status_code=404, detail="Task not found")
     conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     conn.commit()
+    broadcast_workspace_event(existing["workspace_id"], "workspace_mutation", {"entity": "task", "action": "deleted", "taskId": task_id})
     conn.close()
     return {"ok": True}
 
@@ -571,26 +775,34 @@ def list_workspace_members(workspace_id: str, user: dict = Depends(decode_token)
         raise HTTPException(status_code=403, detail="Not a workspace member")
     
     rows = conn.execute(
-        """SELECT wm.user_id, wm.role, wm.created_at, u.name, u.email
+        """SELECT wm.user_id,
+                  CASE WHEN wm.user_id = w.owner_id THEN 'admin' ELSE 'member' END AS role,
+                  wm.created_at,
+                  u.name,
+                  u.email
            FROM workspace_members wm
            JOIN users u ON u.id = wm.user_id
+           JOIN workspaces w ON w.id = wm.workspace_id
            WHERE wm.workspace_id = ?
-           ORDER BY wm.created_at ASC""",
+           ORDER BY CASE WHEN wm.user_id = w.owner_id THEN 0 ELSE 1 END, wm.created_at ASC""",
         (workspace_id,),
     ).fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
 
-class InviteMemberInput(BaseModel):
-    email: str
-    role: str = "member"
-
-
 @app.post("/api/workspaces/{workspace_id}/members/invite")
 def invite_workspace_member(workspace_id: str, input_data: InviteMemberInput, user: dict = Depends(decode_token)) -> dict:
-    """Invite a user to a workspace by email."""
+    """Invite a user to a workspace by email or generate a join link."""
     conn = get_connection()
+
+    workspace = conn.execute(
+        "SELECT id, name, owner_id FROM workspaces WHERE id = ?",
+        (workspace_id,),
+    ).fetchone()
+    if not workspace:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Workspace not found")
     
     # Verify user is a workspace admin
     membership = conn.execute(
@@ -600,34 +812,160 @@ def invite_workspace_member(workspace_id: str, input_data: InviteMemberInput, us
     if not membership or membership["role"] != "admin":
         conn.close()
         raise HTTPException(status_code=403, detail="Only workspace admins can invite members")
-    
-    # Find the user by email
-    target_user = conn.execute(
-        "SELECT id FROM users WHERE email = ?",
-        (input_data.email.lower(),),
-    ).fetchone()
-    if not target_user:
-        conn.close()
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # Add to workspace members
-    try:
-        now = utc_now()
-        conn.execute(
-            "INSERT INTO workspace_members(workspace_id, user_id, role, created_at) VALUES (?, ?, ?, ?)",
-            (workspace_id, target_user["id"], input_data.role, now),
-        )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        conn.close()
-        raise HTTPException(status_code=409, detail="User already a member")
-    
+
+    normalized_email = (input_data.email or "").strip().lower()
+    if normalized_email:
+        existing_member = conn.execute(
+            "SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id IN (SELECT id FROM users WHERE email = ?)",
+            (workspace_id, normalized_email),
+        ).fetchone()
+        if existing_member:
+            conn.close()
+            raise HTTPException(status_code=409, detail="User already a member")
+
+        target_user = conn.execute(
+            "SELECT id, name, email FROM users WHERE email = ?",
+            (normalized_email,),
+        ).fetchone()
+
+        if target_user:
+            now = utc_now()
+            conn.execute(
+                "INSERT INTO workspace_members(workspace_id, user_id, role, created_at) VALUES (?, ?, 'member', ?)",
+                (workspace_id, target_user["id"], now),
+            )
+            conn.commit()
+            row = conn.execute(
+                """SELECT wm.user_id, wm.role, wm.created_at, u.name, u.email
+                   FROM workspace_members wm
+                   JOIN users u ON u.id = wm.user_id
+                   WHERE wm.workspace_id = ? AND wm.user_id = ?""",
+                (workspace_id, target_user["id"]),
+            ).fetchone()
+            conn.close()
+            return {"mode": "member", "member": dict(row)}
+
+    invite_id = str(uuid.uuid4())
+    token = str(uuid.uuid4())
+    now = utc_now()
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=TOKEN_EXPIRY_DAYS)).isoformat()
+    conn.execute(
+        """INSERT INTO workspace_invites(id, workspace_id, token, invitee_email, role, created_by, created_at, expires_at)
+           VALUES (?, ?, ?, ?, 'member', ?, ?, ?)""",
+        (invite_id, workspace_id, token, normalized_email or None, user["id"], now, expires_at),
+    )
+    conn.commit()
+    conn.close()
+    return {
+        "mode": "invite",
+        "token": token,
+        "invite_url": build_invite_url(token),
+        "workspace_id": workspace_id,
+        "workspace_name": workspace["name"],
+        "invitee_email": normalized_email or None,
+        "expires_at": expires_at,
+    }
+
+
+@app.get("/api/invites/{token}")
+def get_invite(token: str) -> dict:
+    conn = get_connection()
     row = conn.execute(
-        """SELECT wm.user_id, wm.role, u.name, u.email
+        """SELECT wi.token, wi.invitee_email, wi.created_at, wi.expires_at, wi.role,
+                  w.id AS workspace_id, w.name AS workspace_name, u.name AS inviter_name
+           FROM workspace_invites wi
+           JOIN workspaces w ON w.id = wi.workspace_id
+           JOIN users u ON u.id = wi.created_by
+           WHERE wi.token = ?""",
+        (token,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    return dict(row)
+
+
+@app.post("/api/invites/{token}/accept")
+def accept_invite(token: str, user: dict = Depends(decode_token)) -> dict:
+    conn = get_connection()
+    invite = conn.execute(
+        "SELECT * FROM workspace_invites WHERE token = ?",
+        (token,),
+    ).fetchone()
+    if not invite:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Invite not found")
+
+    expires_at = datetime.fromisoformat(invite["expires_at"])
+    if expires_at < datetime.now(timezone.utc):
+        conn.close()
+        raise HTTPException(status_code=410, detail="Invite expired")
+
+    if invite["invitee_email"] and invite["invitee_email"].lower() != user["email"].lower():
+        conn.close()
+        raise HTTPException(status_code=403, detail="This invite is for a different email address")
+
+    existing_member = conn.execute(
+        "SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?",
+        (invite["workspace_id"], user["id"]),
+    ).fetchone()
+    if not existing_member:
+        conn.execute(
+            "INSERT INTO workspace_members(workspace_id, user_id, role, created_at) VALUES (?, ?, 'member', ?)",
+            (invite["workspace_id"], user["id"], utc_now()),
+        )
+
+    conn.execute(
+        "UPDATE workspace_invites SET accepted_by = ?, accepted_at = ? WHERE token = ?",
+        (user["id"], utc_now(), token),
+    )
+    conn.commit()
+
+    workspace = conn.execute(
+        "SELECT id, name, description, created_at FROM workspaces WHERE id = ?",
+        (invite["workspace_id"],),
+    ).fetchone()
+    member = conn.execute(
+        """SELECT wm.user_id, wm.role, wm.created_at, u.name, u.email
            FROM workspace_members wm
            JOIN users u ON u.id = wm.user_id
            WHERE wm.workspace_id = ? AND wm.user_id = ?""",
-        (workspace_id, target_user["id"]),
+        (invite["workspace_id"], user["id"]),
     ).fetchone()
     conn.close()
-    return dict(row)
+    return {"workspace": dict(workspace), "member": dict(member)}
+
+
+@app.get("/api/workspaces/{workspace_id}/board")
+def get_board_state(workspace_id: str, user: dict = Depends(decode_token)) -> dict:
+    """Get the current board state for a workspace."""
+    conn = get_connection()
+    
+    # Verify user is a member
+    membership = conn.execute(
+        "SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?",
+        (workspace_id, user["id"]),
+    ).fetchone()
+    if not membership:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Not a workspace member")
+    
+    row = conn.execute(
+        "SELECT elements, app_state, files, updated_by, updated_at FROM board_state WHERE workspace_id = ?",
+        (workspace_id,),
+    ).fetchone()
+    conn.close()
+    
+    if not row:
+        return {"elements": [], "appState": {}, "files": {}, "updatedBy": None, "updatedAt": None}
+    
+    import json
+    return {
+        "elements": json.loads(row["elements"]),
+        "appState": json.loads(row["app_state"]),
+        "files": json.loads(row["files"]),
+        "updatedBy": row["updated_by"],
+        "updatedAt": row["updated_at"],
+    }
+
+

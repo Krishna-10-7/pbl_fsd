@@ -1,7 +1,10 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import Image from "next/image";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useWorkspaceWebSocket, type WorkspaceSocketMessage } from "../lib/workspaceWebSocket";
+const DesignBoard = dynamic(() => import("../components/DesignBoard"), { ssr: false });
 
 /* ═══════════════════════════════════════
    SVG Icon Components
@@ -34,6 +37,14 @@ const Icons = {
   chat: (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
+    </svg>
+  ),
+  board: (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 4h7v7H4z" />
+      <path d="M13 4h7v4h-7z" />
+      <path d="M13 10h7v10h-7z" />
+      <path d="M4 13h7v7H4z" />
     </svg>
   ),
   plus: (
@@ -141,8 +152,9 @@ type DocumentVersion = { id: string; document_id: string; content: string; edite
 type Task = { id: string; title: string; status: "todo" | "in_progress" | "done" };
 type ChatMessage = { id: string; user_id: string; message: string; created_at: string };
 type WorkspaceMember = { user_id: string; role: string; name: string; email: string; created_at: string };
+type InviteActionResult = { mode: "member"; member: WorkspaceMember } | { mode: "invite"; token: string; invite_url: string; workspace_id: string; workspace_name: string; invitee_email: string | null; expires_at: string };
 type ToastMessage = { id: string; text: string; type: "success" | "error" | "info" };
-type NavSection = "overview" | "documents" | "tasks" | "chat";
+type NavSection = "overview" | "documents" | "tasks" | "chat" | "board";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
 
@@ -151,6 +163,7 @@ const NAV_ITEMS: { key: NavSection; label: string; icon: React.ReactNode }[] = [
   { key: "documents", label: "Docs", icon: Icons.document },
   { key: "tasks", label: "Tasks", icon: Icons.tasks },
   { key: "chat", label: "Chat", icon: Icons.chat },
+  { key: "board", label: "Design", icon: Icons.board },
 ];
 
 /* ═══════════════════════════════════════
@@ -182,10 +195,16 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [mounted, setMounted] = useState(false);
   const [chatLoading, setChatLoading] = useState(false);
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteLink, setInviteLink] = useState("");
+  const [pendingInviteToken, setPendingInviteToken] = useState("");
+  const [inviteBusy, setInviteBusy] = useState(false);
+  const [acceptingInvite, setAcceptingInvite] = useState(false);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const chatPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const inviteAttemptedRef = useRef("");
 
   const selectedWorkspace = useMemo(() => workspaces.find((w) => w.id === selectedWorkspaceId) || null, [workspaces, selectedWorkspaceId]);
   const selectedDocument = useMemo(() => documents.find((d) => d.id === selectedDocumentId) || null, [documents, selectedDocumentId]);
@@ -245,6 +264,28 @@ export default function Home() {
     }
   }, [api, showToast]);
 
+  const acceptInvite = useCallback(async (inviteToken: string) => {
+    if (!inviteToken || !user || acceptingInvite) return;
+    setAcceptingInvite(true);
+    try {
+      const result = await api<{ workspace: Workspace; member: WorkspaceMember }>(`/invites/${inviteToken}/accept`, { method: "POST" });
+      setWorkspaces((prev) => [result.workspace, ...prev.filter((workspace) => workspace.id !== result.workspace.id)]);
+      setSelectedWorkspaceId(result.workspace.id);
+      setActiveNav("overview");
+      setShowMemberPanel(false);
+      setPendingInviteToken("");
+      setInviteLink("");
+      window.history.replaceState({}, "", window.location.pathname);
+      showToast(`Joined ${result.workspace.name}`, "success");
+      await loadWorkspaceData(result.workspace.id);
+      await loadWorkspaceMembers(result.workspace.id);
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : "Failed to join invite", "error");
+    } finally {
+      setAcceptingInvite(false);
+    }
+  }, [acceptingInvite, api, loadWorkspaceData, loadWorkspaceMembers, showToast, user]);
+
   const refreshChat = useCallback(async () => {
     if (!selectedWorkspaceId || !token) return;
     try {
@@ -262,6 +303,74 @@ export default function Home() {
       setChatLoading(false);
     }
   }, [api, selectedWorkspaceId, token]);
+
+  const handleWorkspaceMessage = useCallback((message: WorkspaceSocketMessage) => {
+    if (!selectedWorkspaceId) return;
+
+    if (message.type === "workspace_snapshot") {
+      const payload = message.payload;
+      if (payload?.documents && payload?.tasks && payload?.chat) {
+        const documentsSnapshot = payload.documents as DocumentItem[];
+        const tasksSnapshot = payload.tasks as Task[];
+        const chatSnapshot = payload.chat as ChatMessage[];
+        setDocuments(documentsSnapshot);
+        setTasks(tasksSnapshot);
+        setChat(chatSnapshot);
+        if (documentsSnapshot.length > 0) {
+          setSelectedDocumentId(documentsSnapshot[0].id);
+          setEditorContent(documentsSnapshot[0].content);
+        }
+        const uids = [...new Set(chatSnapshot.map((item) => item.user_id))];
+        if (uids.length > 0) {
+          api<Record<string, string>>("/users/names", { method: "POST", body: JSON.stringify({ userIds: uids }) })
+            .then((names) => setUserNames((previous) => ({ ...previous, ...names })))
+            .catch(() => undefined);
+        }
+      }
+      return;
+    }
+
+    if (message.type === "workspace_mutation") {
+      const entity = message.payload?.entity as string | undefined;
+      if (entity === "chat") {
+        const createdMessage = message.payload?.message as ChatMessage | undefined;
+        if (createdMessage) {
+          setChat((previous) => {
+            if (previous.some((item) => item.id === createdMessage.id)) return previous;
+            return [...previous, createdMessage];
+          });
+        } else {
+          refreshChat();
+        }
+        return;
+      }
+
+      loadWorkspaceData(selectedWorkspaceId);
+      if (selectedDocumentId) {
+        loadDocumentVersions(selectedDocumentId);
+      }
+      return;
+    }
+
+    if (message.type === "workspace_deleted") {
+      const deletedWorkspaceId = message.payload?.workspaceId as string | undefined;
+      if (deletedWorkspaceId && deletedWorkspaceId === selectedWorkspaceId) {
+        setSelectedWorkspaceId("");
+        setDocuments([]);
+        setTasks([]);
+        setChat([]);
+        setWorkspaceMembers([]);
+        showToast("Workspace was deleted", "info");
+      }
+    }
+  }, [api, loadDocumentVersions, loadWorkspaceData, refreshChat, selectedDocumentId, selectedWorkspaceId, showToast]);
+
+  useWorkspaceWebSocket({
+    workspaceId: selectedWorkspaceId,
+    token,
+    enabled: Boolean(token && selectedWorkspaceId),
+    onMessage: handleWorkspaceMessage,
+  });
 
   /* ── Auth ── */
   async function handleAuth(fd: FormData) {
@@ -317,33 +426,60 @@ export default function Home() {
   /* ── Chat ── */
   async function sendMessage(fd: FormData) {
     if (!selectedWorkspace) return; const msg = fd.get("chatMessage")?.toString() || ""; if (!msg.trim()) return;
-    try { const c = await api<ChatMessage>("/chat", { method: "POST", body: JSON.stringify({ workspaceId: selectedWorkspace.id, message: msg }) }); setChat((p) => [...p, c]); if (user) setUserNames((p) => ({ ...p, [user.id]: user.name })); } catch (e) { showToast(e instanceof Error ? e.message : "Failed", "error"); }
+    try { await api<ChatMessage>("/chat", { method: "POST", body: JSON.stringify({ workspaceId: selectedWorkspace.id, message: msg }) }); } catch (e) { showToast(e instanceof Error ? e.message : "Failed", "error"); }
   }
 
   function logout() {
     localStorage.removeItem("collabspace_token"); localStorage.removeItem("collabspace_user");
     setToken(""); setUser(null); setWorkspaces([]); setSelectedWorkspaceId(""); setDocuments([]); setTasks([]); setChat([]); setActiveNav("overview");
+    setInviteEmail(""); setInviteLink(""); setPendingInviteToken(""); setInviteBusy(false); setAcceptingInvite(false);
     showToast("Signed out", "info");
+  }
+
+  async function inviteMember(fd: FormData) {
+    if (!selectedWorkspace) return;
+    const email = fd.get("inviteEmail")?.toString() || "";
+    try {
+      setInviteBusy(true);
+      const result = await api<InviteActionResult>(`/workspaces/${selectedWorkspace.id}/members/invite`, {
+        method: "POST",
+        body: JSON.stringify({ email }),
+      });
+
+      if (result.mode === "member") {
+        setInviteEmail("");
+        setInviteLink("");
+        await loadWorkspaceMembers(selectedWorkspace.id);
+        showToast(`${result.member.name} joined the workspace`, "success");
+        return;
+      }
+
+      setInviteLink(result.invite_url);
+      setInviteEmail("");
+      await navigator.clipboard?.writeText(result.invite_url).catch(() => undefined);
+      showToast("Invite link created and copied", "success");
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : "Failed to invite member", "error");
+    } finally {
+      setInviteBusy(false);
+    }
   }
 
   function formatTime(s: string) { try { return new Date(s).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true }); } catch { return ""; } }
   function getInitials(n: string) { return n.split(" ").map((w) => w[0]).join("").toUpperCase().slice(0, 2); }
 
   /* ── Effects ── */
-  useEffect(() => { setMounted(true); const t = localStorage.getItem("collabspace_token") || ""; const u = localStorage.getItem("collabspace_user"); setToken(t); if (u) try { setUser(JSON.parse(u)); } catch { /* */ } }, []);
+  useEffect(() => { setMounted(true); const t = localStorage.getItem("collabspace_token") || ""; const u = localStorage.getItem("collabspace_user"); setToken(t); if (u) try { setUser(JSON.parse(u)); } catch { /* */ } const invite = new URLSearchParams(window.location.search).get("invite") || ""; if (invite) setPendingInviteToken(invite); }, []);
   useEffect(() => { if (!token) return; api<Workspace[]>("/workspaces").then((items) => { setWorkspaces(items); if (items.length > 0) setSelectedWorkspaceId(items[0].id); }).catch((e) => { if (e.message.includes("Invalid") || e.message.includes("expired")) logout(); }); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [token]);
   useEffect(() => { if (selectedWorkspaceId && token) { loadWorkspaceData(selectedWorkspaceId); loadWorkspaceMembers(selectedWorkspaceId); } /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [selectedWorkspaceId]);
   useEffect(() => { if (selectedDocument) setEditorContent(selectedDocument.content); if (selectedDocumentId) loadDocumentVersions(selectedDocumentId); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [selectedDocument, selectedDocumentId]);
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chat]);
-  
-  // Chat polling - refresh every 3 seconds when viewing chat
   useEffect(() => {
-    if (activeNav !== "chat" || !selectedWorkspaceId || !token) return;
-    refreshChat();
-    chatPollRef.current = setInterval(refreshChat, 3000);
-    return () => { if (chatPollRef.current) clearInterval(chatPollRef.current); };
-  }, [activeNav, selectedWorkspaceId, token, refreshChat]);
-
+    if (!pendingInviteToken || !token || !user || inviteAttemptedRef.current === pendingInviteToken) return;
+    inviteAttemptedRef.current = pendingInviteToken;
+    acceptInvite(pendingInviteToken);
+  }, [acceptInvite, pendingInviteToken, token, user]);
+  
   /* ── Render guards ── */
   if (!mounted) return <div style={{ minHeight: "100vh", background: "#f2f4f8" }} />;
 
@@ -358,6 +494,11 @@ export default function Home() {
               <h1>CollabSpace</h1>
             </div>
             <p className="subtitle">Real-time collaborative workspace for documents, tasks & team communication.</p>
+            {pendingInviteToken && (
+              <div style={{ marginBottom: "1rem", padding: "0.75rem 0.9rem", borderRadius: "0.75rem", background: "#ecfeff", border: "1px solid #a5f3fc", color: "#155e75", fontSize: "0.875rem" }}>
+                Invitation link detected. Sign in or register to join the workspace.
+              </div>
+            )}
             <form id="auth-form" onSubmit={(e) => { e.preventDefault(); handleAuth(new FormData(e.currentTarget)); }}>
               {authMode === "register" && (<div className="input-group"><label htmlFor="auth-name">Full Name</label><input id="auth-name" name="name" placeholder="Enter your name" required /></div>)}
               <div className="input-group"><label htmlFor="auth-email">Email</label><input id="auth-email" type="email" name="email" placeholder="you@example.com" required /></div>
@@ -406,6 +547,7 @@ export default function Home() {
                 {activeNav === "documents" && "Documents"}
                 {activeNav === "tasks" && "Project Board"}
                 {activeNav === "chat" && "Team Chat"}
+                {activeNav === "board" && "Design Board"}
               </h1>
             </div>
             <div className="header-right">
@@ -434,6 +576,48 @@ export default function Home() {
                 <h3 style={{ margin: 0, fontSize: "0.875rem", fontWeight: 600 }}>Workspace Members ({workspaceMembers.length})</h3>
                 <button onClick={() => setShowMemberPanel(false)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: "1.25rem" }}>×</button>
               </div>
+              <form onSubmit={(e) => { e.preventDefault(); const f = e.currentTarget; inviteMember(new FormData(f)).finally(() => { f.reset(); setInviteEmail(""); }); }} style={{ display: "grid", gap: "0.75rem", marginBottom: "1rem" }}>
+                <input
+                  name="inviteEmail"
+                  value={inviteEmail}
+                  onChange={(e) => setInviteEmail(e.target.value)}
+                  placeholder="Invite by email, or leave blank to create a link"
+                  type="email"
+                  style={{ width: "100%", padding: "0.75rem 0.9rem", border: "1px solid #d1d5db", borderRadius: "0.5rem" }}
+                />
+                <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+                  <button type="submit" className="btn-sm" disabled={inviteBusy}>{inviteBusy ? "Working..." : "Invite / Create Link"}</button>
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={!inviteLink}
+                    onClick={async () => {
+                      if (!inviteLink) return;
+                      try {
+                        await navigator.clipboard.writeText(inviteLink);
+                        showToast("Invite link copied", "success");
+                      } catch {
+                        showToast("Could not copy the invite link", "error");
+                      }
+                    }}
+                  >
+                    Copy Link
+                  </button>
+                </div>
+              </form>
+              {inviteLink && (
+                <div style={{ marginBottom: "1rem", padding: "0.75rem", background: "#fff", borderRadius: "0.5rem", border: "1px solid #dbeafe", fontSize: "0.8rem", wordBreak: "break-all" }}>
+                  <div style={{ fontWeight: 600, marginBottom: "0.35rem" }}>Share this link</div>
+                  <div style={{ color: "#2563eb" }}>{inviteLink}</div>
+                  <a
+                    href={`mailto:?subject=${encodeURIComponent(`Join ${selectedWorkspace?.name || "CollabSpace"}`)}&body=${encodeURIComponent(`Use this invite link to join ${selectedWorkspace?.name || "the workspace"}: ${inviteLink}`)}`}
+                    style={{ display: "inline-block", marginTop: "0.5rem", color: "#be185d", fontWeight: 600 }}
+                  >
+                    Open email draft
+                  </a>
+                </div>
+              )}
+              {acceptingInvite && <p style={{ margin: "0 0 1rem 0", fontSize: "0.875rem", color: "#6b7280" }}>Joining invite...</p>}
               {workspaceMembers.length === 0 ? (
                 <p style={{ margin: 0, fontSize: "0.875rem", color: "#6b7280" }}>No members yet</p>
               ) : (
@@ -562,6 +746,36 @@ export default function Home() {
                     </div>
                   </div>
                 )}
+              </div>
+            </div>
+          )}
+
+          {/* ═══ DESIGN BOARD ═══ */}
+          {selectedWorkspace && activeNav === "board" && !loading && (
+            <div className="page-view fade-in">
+              <div className="card full-height">
+                <div className="card-header">
+                  <h3>Design Board</h3>
+                </div>
+                <div className="design-board-layout">
+                  <aside className="design-board-sidebar">
+                    <div className="design-board-note">
+                      <h4>How to use</h4>
+                      <p>Use the Excalidraw toolbar to place shapes, text, arrows, and freehand sketches inside this workspace.</p>
+                    </div>
+                    <div className="design-board-note">
+                      <h4>Workspace</h4>
+                      <p>{selectedWorkspace.name}</p>
+                    </div>
+                    <div className="design-board-note">
+                      <h4>Persistence</h4>
+                      <p>Saved locally for this project board.</p>
+                    </div>
+                  </aside>
+                  <div className="design-board-canvas-wrap">
+                    <DesignBoard workspaceId={selectedWorkspace.id} />
+                  </div>
+                </div>
               </div>
             </div>
           )}

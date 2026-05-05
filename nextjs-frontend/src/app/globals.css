@@ -460,6 +460,60 @@ body {
 .btn-send:hover { background: var(--accent-hover); }
 
 /* ══════════════════════
+   DESIGN BOARD
+   ══════════════════════ */
+.design-board-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 0.85rem;
+  flex: 1;
+  min-height: 0;
+}
+.design-board-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.design-board-note {
+  background: #fafbfd;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  padding: 0.85rem;
+}
+.design-board-note h4 {
+  font-size: 0.8rem;
+  font-weight: 700;
+  margin-bottom: 0.3rem;
+}
+.design-board-note p {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+.design-board-canvas-wrap {
+  position: relative;
+  min-height: 520px;
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: #fff;
+  box-shadow: var(--shadow-sm);
+}
+.design-board-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+  cursor: crosshair;
+}
+.btn-sm.active-tool {
+  background: #3b82f6;
+}
+.btn-sm.active-tool:hover {
+  background: #2563eb;
+}
+
+/* ══════════════════════
    EMPTY STATES
    ══════════════════════ */
 .empty-state { padding: 1.75rem 1rem; text-align: center; color: var(--text-muted); }
@@ -526,4 +580,6 @@ body {
   .doc-layout { grid-template-columns: 1fr; }
   .doc-sidebar { border-right: none; border-bottom: 1px solid var(--border-light); padding-right: 0; padding-bottom: 0.3rem; max-height: 130px; }
   .create-workspace-form input { width: 120px; }
+  .design-board-layout { grid-template-columns: 1fr; }
+  .design-board-canvas-wrap { min-height: 420px; }
 }
