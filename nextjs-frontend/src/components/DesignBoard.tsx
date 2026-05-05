@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Excalidraw, type ExcalidrawImperativeAPI, type InitialDataState } from "@excalidraw/excalidraw";
+import { Excalidraw, type InitialDataState } from "@excalidraw/excalidraw";
+type ExcalidrawImperativeAPI = Parameters<NonNullable<React.ComponentProps<typeof Excalidraw>["excalidrawAPI"]>>[0];
 import { useWorkspaceWebSocket, type WorkspaceSocketMessage } from "../lib/workspaceWebSocket";
 
 type DesignBoardProps = {
