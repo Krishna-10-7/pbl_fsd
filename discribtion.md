@@ -59,11 +59,6 @@ Cost-Effective and Customizable Solution
 
 
 
-
-
-
-
-
 ADVANTAGES OF USING THIS SYSTEM
 
 
